@@ -11,17 +11,17 @@ L.Icon.Default.mergeOptions({
   shadowUrl: 'https://unpkg.com/leaflet@1.9.4/dist/images/marker-shadow.png',
 })
 
-const ORS_API_KEY = '5b3ce3597851110001cf6248a5e6e0c0f4604e7ebff16f1b63d0b8f2' // Free ORS API key for demo
+const ORS_API_KEY = import.meta.env.VITE_ORS_API_KEY || '5b3ce3597851110001cf6248a5e6e0c0f4604e7ebff16f1b63d0b8f2' // Free ORS API key for demo
 
 function App() {
   const [waypoints, setWaypoints] = useState([])
   const [hazardPolygons, setHazardPolygons] = useState([])
+  const [currentPolygon, setCurrentPolygon] = useState([])
   const [route, setRoute] = useState(null)
   const [routeInfo, setRouteInfo] = useState(null)
   const [error, setError] = useState(null)
   const [mode, setMode] = useState('none') // 'waypoint', 'hazard', 'none'
   const [waypointBufferRadius, setWaypointBufferRadius] = useState(500) // meters
-  const currentPolygonRef = useRef([])
 
   const handleCalculateRoute = async () => {
     if (waypoints.length < 2) {
@@ -116,10 +116,10 @@ function App() {
   const handleClearAll = () => {
     setWaypoints([])
     setHazardPolygons([])
+    setCurrentPolygon([])
     setRoute(null)
     setRouteInfo(null)
     setError(null)
-    currentPolygonRef.current = []
   }
 
   return (
@@ -142,8 +142,8 @@ function App() {
         <button 
           onClick={() => {
             setMode(mode === 'hazard-polygon' ? 'none' : 'hazard-polygon')
-            if (currentPolygonRef.current.length > 0) {
-              currentPolygonRef.current = []
+            if (currentPolygon.length > 0) {
+              setCurrentPolygon([])
             }
           }}
           style={{ background: mode === 'hazard-polygon' ? '#ffc107' : '#ffc107', color: '#000' }}
@@ -151,18 +151,18 @@ function App() {
           {mode === 'hazard-polygon' ? '✓ Drawing Hazard Area' : 'Draw Hazard Area'}
         </button>
 
-        {mode === 'hazard-polygon' && currentPolygonRef.current.length > 0 && (
+        {mode === 'hazard-polygon' && currentPolygon.length > 0 && (
           <button 
             onClick={() => {
-              if (currentPolygonRef.current.length >= 3) {
-                setHazardPolygons([...hazardPolygons, [...currentPolygonRef.current]])
-                currentPolygonRef.current = []
+              if (currentPolygon.length >= 3) {
+                setHazardPolygons([...hazardPolygons, [...currentPolygon]])
+                setCurrentPolygon([])
                 setMode('none')
               }
             }}
             style={{ background: '#28a745' }}
           >
-            Finish Polygon ({currentPolygonRef.current.length} points)
+            Finish Polygon ({currentPolygon.length} points)
           </button>
         )}
 
@@ -210,7 +210,8 @@ function App() {
             mode={mode} 
             waypoints={waypoints}
             setWaypoints={setWaypoints}
-            currentPolygonRef={currentPolygonRef}
+            currentPolygon={currentPolygon}
+            setCurrentPolygon={setCurrentPolygon}
           />
 
           {/* Render waypoints */}
@@ -237,9 +238,9 @@ function App() {
           ))}
 
           {/* Render current polygon being drawn */}
-          {mode === 'hazard-polygon' && currentPolygonRef.current.length > 0 && (
+          {mode === 'hazard-polygon' && currentPolygon.length > 0 && (
             <Polygon
-              positions={currentPolygonRef.current.map(p => [p.lat, p.lng])}
+              positions={currentPolygon.map(p => [p.lat, p.lng])}
               pathOptions={{ color: 'yellow', fillColor: 'yellow', fillOpacity: 0.2, dashArray: '5, 5' }}
             />
           )}
@@ -266,7 +267,7 @@ function App() {
   )
 }
 
-function MapClickHandler({ mode, waypoints, setWaypoints, currentPolygonRef }) {
+function MapClickHandler({ mode, waypoints, setWaypoints, currentPolygon, setCurrentPolygon }) {
   useMapEvents({
     click: (e) => {
       const { lat, lng } = e.latlng
@@ -276,9 +277,7 @@ function MapClickHandler({ mode, waypoints, setWaypoints, currentPolygonRef }) {
       } else if (mode === 'hazard-point') {
         setWaypoints([...waypoints, { lat, lng, isHazard: true }])
       } else if (mode === 'hazard-polygon') {
-        currentPolygonRef.current = [...currentPolygonRef.current, { lat, lng }]
-        // Force re-render by updating state
-        setWaypoints([...waypoints])
+        setCurrentPolygon([...currentPolygon, { lat, lng }])
       }
     }
   })

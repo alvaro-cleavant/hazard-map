@@ -17,6 +17,17 @@ A demo application for hazard-aware routing using Leaflet, React-Leaflet, and Op
 npm install
 ```
 
+### Configuration
+
+Optionally, you can set your own OpenRouteService API key by creating a `.env` file:
+
+```bash
+cp .env.example .env
+# Edit .env and add your API key
+```
+
+The application includes a free demo API key, but for production use, please register for your own key at [OpenRouteService](https://openrouteservice.org/).
+
 ## Usage
 
 ### Development Mode
