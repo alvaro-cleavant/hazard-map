@@ -33,6 +33,13 @@ type Hazard = GeoJSON.Polygon | GeoJSON.MultiPolygon;
 type LngLat = [number, number];
 type LatLngNum = [number, number];
 
+/* ---------- ORS heuristic limits (tune if needed) ---------- */
+const ORS_MAX_AVOID_AREA_KM2 = 200; // safe ceiling per polygon
+const ORS_MAX_AVOID_BBOX_SIDE_KM = 20; // max width or height
+const MAX_DRAWN_CIRCLE_RADIUS_M = 5000; // prevent huge circles at draw time
+const OFF_ROUTE_THRESHOLD_M = 40; // off-route threshold
+const MAX_ROUTE_KM_WITH_AVOID = 150; // guard for very long routes with avoids
+
 /* ---------- Helpers ---------- */
 function toGeoJSONPolygon(layer: any): Hazard | null {
   if (!layer) return null;
@@ -43,6 +50,7 @@ function toGeoJSONPolygon(layer: any): Hazard | null {
   ) {
     return gj.geometry as Hazard;
   }
+  // Circle -> polygon (approx)
   if (layer instanceof (L as any).Circle) {
     const center = layer.getLatLng();
     const radius = layer.getRadius(); // meters
@@ -58,6 +66,7 @@ function toGeoJSONPolygon(layer: any): Hazard | null {
 function unionHazards(polys: Hazard[]): Hazard | null {
   if (polys.length === 0) return null;
   if (polys.length === 1) return polys[0];
+  // Try union; fallback to simple MultiPolygon concat
   try {
     let acc: any = turf.feature(polys[0]);
     for (let i = 1; i < polys.length; i++) {
@@ -87,13 +96,14 @@ function debounce<T extends (...a: any[]) => void>(fn: T, ms: number) {
   };
 }
 
+// Simplify ORS route and sample as waypoints for Google handoff
 function simplifyAndSampleWaypoints(
   routeLngLat: LngLat[],
   maxPoints = 8
 ): { lat: number; lng: number }[] {
   if (!routeLngLat.length) return [];
   const simplified = turf.simplify(turf.lineString(routeLngLat), {
-    tolerance: 0.0009,
+    tolerance: 0.0009, // ~100m
     highQuality: false,
   }).geometry.coordinates as LngLat[];
   const pts =
@@ -121,6 +131,27 @@ function openGMaps(
       via.map((v) => `${v.lat},${v.lng}`).join("|")
     );
   window.location.href = url.toString();
+}
+
+function polygonAreaKm2(poly: GeoJSON.Polygon) {
+  return turf.area(poly) / 1_000_000;
+}
+
+function bboxSideKm(poly: GeoJSON.Polygon) {
+  const [minX, minY, maxX, maxY] = turf.bbox(poly);
+  const width = turf.distance([minX, maxY], [maxX, maxY], {
+    units: "kilometers",
+  });
+  const height = turf.distance([minX, minY], [minX, maxY], {
+    units: "kilometers",
+  });
+  return { width, height };
+}
+
+function approxStartEndKm(a: LatLngExpression, b: LatLngExpression) {
+  const [alat, alng] = a as [number, number];
+  const [blat, blng] = b as [number, number];
+  return turf.distance([alng, alat], [blng, blat], { units: "kilometers" });
 }
 
 /* ---------- Click handler (inside MapContainer) ---------- */
@@ -175,7 +206,6 @@ export default function LeafletHazardMap() {
   // Misc
   const drawnItemsRef = useRef<L.FeatureGroup | null>(null);
   const mapRef = useRef<L.Map | null>(null);
-  const OFF_ROUTE_THRESHOLD_M = 40;
 
   /* ---------- Hazards IO ---------- */
   const addBufferedHazardPoint = useCallback(
@@ -192,6 +222,20 @@ export default function LeafletHazardMap() {
   );
 
   const onCreated = useCallback((e: any) => {
+    // prevent very large circles (which ORS will reject)
+    if (e.layer instanceof (L as any).Circle) {
+      const r = e.layer.getRadius?.() ?? 0;
+      if (r > MAX_DRAWN_CIRCLE_RADIUS_M) {
+        alert(
+          `Circle too large (>${
+            MAX_DRAWN_CIRCLE_RADIUS_M / 1000
+          } km radius). Please draw a smaller hazard.`
+        );
+        // @ts-ignore
+        drawnItemsRef.current?.removeLayer?.(e.layer);
+        return;
+      }
+    }
     const poly = toGeoJSONPolygon(e.layer);
     if (poly) setHazards((prev) => [...prev, poly]);
   }, []);
@@ -214,21 +258,96 @@ export default function LeafletHazardMap() {
     setHazards(remaining);
   }, []);
 
+  // Build avoid_polygons but filter out shapes that likely break ORS limits
   const avoidPolygons = useMemo<GeoJSON.MultiPolygon | null>(() => {
     if (!hazards.length) return null;
+
     const merged = unionHazards(hazards);
     if (!merged) return null;
-    return merged.type === "Polygon"
-      ? {
-          type: "MultiPolygon",
-          coordinates: [merged.coordinates as number[][][]],
-        }
-      : (merged as GeoJSON.MultiPolygon);
+
+    // Normalize to MultiPolygon
+    const multi: GeoJSON.MultiPolygon =
+      merged.type === "Polygon"
+        ? {
+            type: "MultiPolygon",
+            coordinates: [merged.coordinates as number[][][]],
+          }
+        : (merged as GeoJSON.MultiPolygon);
+
+    const validPolys: number[][][][] = [];
+    const dropped: { area: number; width: number; height: number }[] = [];
+
+    for (const polyCoords of multi.coordinates) {
+      const poly = {
+        type: "Polygon",
+        coordinates: polyCoords,
+      } as GeoJSON.Polygon;
+
+      // Ensure outer ring is closed
+      const outer = poly.coordinates[0];
+      if (!outer || outer.length < 4) continue;
+      const first = outer[0];
+      const last = outer[outer.length - 1];
+      if (first[0] !== last[0] || first[1] !== last[1]) {
+        poly.coordinates[0] = [...outer, first];
+      }
+
+      const area = polygonAreaKm2(poly);
+      const { width, height } = bboxSideKm(poly);
+
+      if (
+        area <= ORS_MAX_AVOID_AREA_KM2 &&
+        width <= ORS_MAX_AVOID_BBOX_SIDE_KM &&
+        height <= ORS_MAX_AVOID_BBOX_SIDE_KM
+      ) {
+        validPolys.push(poly.coordinates as number[][][]);
+      } else {
+        dropped.push({ area, width, height });
+      }
+    }
+
+    if (dropped.length) {
+      console.warn(
+        "Some hazard polygons were too large for ORS and were skipped:",
+        dropped
+      );
+      alert(
+        `Some hazard areas are too large for routing and were skipped.\n\n` +
+          dropped
+            .map(
+              (d, i) =>
+                `#${i + 1}: area ≈ ${d.area.toFixed(
+                  0
+                )} km², bbox ≈ ${d.width.toFixed(1)}×${d.height.toFixed(1)} km`
+            )
+            .join("\n")
+      );
+    }
+
+    if (!validPolys.length) return null;
+    return { type: "MultiPolygon", coordinates: validPolys };
   }, [hazards]);
 
   /* ---------- ORS routing ---------- */
   const fetchRoute = useCallback(async () => {
     if (!start || !end) return;
+
+    // Guard: very long routes with avoids often fail on free tiers
+    if (avoidPolygons) {
+      const dk = approxStartEndKm(
+        start as [number, number],
+        end as [number, number]
+      );
+      if (dk > MAX_ROUTE_KM_WITH_AVOID) {
+        alert(
+          `Route too long with hazards (≈ ${dk.toFixed(
+            0
+          )} km). Try a shorter leg or remove some hazards.`
+        );
+        return;
+      }
+    }
+
     setRoute(null);
     setRouteLngLat(null);
 
@@ -259,7 +378,9 @@ export default function LeafletHazardMap() {
 
     if (!res.ok) {
       console.error(await res.text());
-      alert("Routing failed (check API key/limits).");
+      alert(
+        "Routing failed (bad request or limits). Try smaller hazards or shorter leg."
+      );
       return;
     }
 
@@ -289,7 +410,6 @@ export default function LeafletHazardMap() {
     },
     [routeLngLat]
   );
-
   const debouncedComputeOffRoute = useMemo(
     () => debounce(computeOffRoute, 400),
     [computeOffRoute]
@@ -355,21 +475,15 @@ export default function LeafletHazardMap() {
     `${btnBase} bg-transparent text-gray-700 hover:bg-gray-100 active:opacity-95 ` +
     "dark:text-neutral-200 dark:hover:bg-neutral-800";
   const btnDanger = `${btnBase} bg-red-500 text-white hover:bg-red-600 active:opacity-90`;
-
-  const chip =
-    "inline-flex items-center rounded-md px-2 py-1 text-xs font-medium bg-gray-100 text-gray-700 " +
-    "dark:bg-neutral-800 dark:text-neutral-200";
-
   const activeRing = "ring-2 ring-sky-500";
 
   const canHandOff = !!(start && end && routeLngLat && routeLngLat.length >= 2);
-
   const handleHandOff = () => {
     if (!canHandOff) return;
     const origin = { lat: (start as number[])[0], lng: (start as number[])[1] };
     const dest = { lat: (end as number[])[0], lng: (end as number[])[1] };
     const via = simplifyAndSampleWaypoints(routeLngLat!, 8);
-    const trimmed = via.slice(1, Math.max(1, via.length - 1));
+    const trimmed = via.slice(1, Math.max(1, via.length - 1)); // drop endpoints
     openGMaps(origin, dest, trimmed);
   };
 
@@ -477,7 +591,7 @@ export default function LeafletHazardMap() {
 
             {/* Buffer + status */}
             <div className="flex items-center gap-3 flex-wrap">
-              <div className={chip}>
+              <div className="inline-flex items-center rounded-md px-2 py-1 text-xs font-medium bg-gray-100 text-gray-700 dark:bg-neutral-800 dark:text-neutral-200">
                 Buffer{" "}
                 <span className="mx-1 font-semibold">
                   {hazardBufferMeters} m
