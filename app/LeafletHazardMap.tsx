@@ -300,13 +300,19 @@ export default function LeafletHazardMap() {
   >(null);
   const [hazardBufferMeters, setHazardBufferMeters] = useState<number>(150);
 
-  // Realtime nav
+  // Realtime nav (real GPS)
   const [navigating, setNavigating] = useState(false);
   const [userPos, setUserPos] = useState<LatLngNum | null>(null);
   const [offRoute, setOffRoute] = useState(false);
   const [offRouteMeters, setOffRouteMeters] = useState<number>(0);
   const watchIdRef = useRef<number | null>(null);
   const wakeLockRef = useRef<any>(null);
+
+  // Realtime nav (simulation)
+  const [simulateOn, setSimulateOn] = useState(false);
+  const [simSpeedKmh, setSimSpeedKmh] = useState(40);
+  const simTimerRef = useRef<number | null>(null);
+  const simDistKmRef = useRef(0);
 
   // Misc
   const drawnItemsRef = useRef<L.FeatureGroup | null>(null);
@@ -317,9 +323,9 @@ export default function LeafletHazardMap() {
     (latlng: LatLngExpression) => {
       const [lat, lng] = latlng as [number, number];
 
-      // Add visible circle layer into the FeatureGroup so it persists across modes
+      // Visible circle layer persists across modes
       const layer = L.circle([lat, lng], {
-        radius: Math.max(1, hazardBufferMeters), // meters
+        radius: Math.max(1, hazardBufferMeters),
         color: "#ef4444",
         weight: 2,
         fillColor: "#ef4444",
@@ -519,7 +525,7 @@ export default function LeafletHazardMap() {
     setInstructions(list);
   }, [start, end, avoidPolygons]);
 
-  /* ---------- Realtime Navigation ---------- */
+  /* ---------- Off-route compute (shared) ---------- */
   const computeOffRoute = useCallback(
     (pos: LatLngNum) => {
       if (!routeLngLat || routeLngLat.length < 2) {
@@ -540,9 +546,14 @@ export default function LeafletHazardMap() {
     [computeOffRoute]
   );
 
+  /* ---------- Realtime Navigation (REAL GPS) ---------- */
   const startNavigation = useCallback(async () => {
     if (!routeLngLat || routeLngLat.length < 2) {
       alert("Get directions first.");
+      return;
+    }
+    if (simulateOn) {
+      alert("Stop simulation first.");
       return;
     }
     if (watchIdRef.current != null) return;
@@ -568,7 +579,7 @@ export default function LeafletHazardMap() {
       { enableHighAccuracy: true, maximumAge: 1000, timeout: 10000 }
     );
     setNavigating(true);
-  }, [routeLngLat, debouncedComputeOffRoute]);
+  }, [routeLngLat, debouncedComputeOffRoute, simulateOn]);
 
   const stopNavigation = useCallback(() => {
     if (watchIdRef.current != null) {
@@ -585,11 +596,72 @@ export default function LeafletHazardMap() {
     setOffRouteMeters(0);
   }, []);
 
+  /* ---------- Realtime Navigation (SIMULATION) ---------- */
+  const stepSimulation = useCallback(() => {
+    if (!routeLngLat || routeLngLat.length < 2) return;
+    const line = turf.lineString(routeLngLat);
+    const totalKm = turf.length(line, { units: "kilometers" });
+
+    // advance distance: tick = 500ms
+    const dtSeconds = 0.5;
+    const dvKm = (simSpeedKmh / 3600) * dtSeconds;
+    simDistKmRef.current += dvKm;
+
+    // stop when finished
+    if (simDistKmRef.current >= totalKm) {
+      simDistKmRef.current = totalKm;
+      if (simTimerRef.current) {
+        clearInterval(simTimerRef.current);
+        simTimerRef.current = null;
+      }
+      setSimulateOn(false);
+    }
+
+    // compute position and feed into same flow as real GPS
+    const pt = turf.along(line, simDistKmRef.current, { units: "kilometers" });
+    const [lng, lat] = pt.geometry.coordinates as [number, number];
+    const here: [number, number] = [lat, lng];
+    setUserPos(here);
+    computeOffRoute(here);
+    if (mapRef.current) {
+      mapRef.current.setView(here, Math.max(mapRef.current.getZoom(), 14), {
+        animate: true,
+      });
+    }
+  }, [routeLngLat, simSpeedKmh, computeOffRoute]);
+
+  const startSimulation = useCallback(() => {
+    if (!routeLngLat || routeLngLat.length < 2) {
+      alert("Get directions first, then start simulation.");
+      return;
+    }
+    if (navigating) {
+      alert("Stop real navigation first.");
+      return;
+    }
+    simDistKmRef.current = 0;
+    setSimulateOn(true);
+    if (simTimerRef.current) clearInterval(simTimerRef.current);
+    simTimerRef.current = window.setInterval(
+      stepSimulation,
+      500
+    ) as unknown as number;
+  }, [routeLngLat, navigating, stepSimulation]);
+
+  const stopSimulation = useCallback(() => {
+    if (simTimerRef.current) {
+      clearInterval(simTimerRef.current);
+      simTimerRef.current = null;
+    }
+    setSimulateOn(false);
+  }, []);
+
   useEffect(() => {
     return () => {
       stopNavigation();
+      stopSimulation();
     };
-  }, [stopNavigation]);
+  }, [stopNavigation, stopSimulation]);
 
   /* ---------- Buttons (Tailwind-only) ---------- */
   const btnBase =
@@ -798,6 +870,41 @@ export default function LeafletHazardMap() {
                   Open in Google Maps
                 </button>
 
+                {/* Simulation controls */}
+                <div className="flex items-center gap-2">
+                  <label className="text-xs text-gray-600 dark:text-neutral-300">
+                    Sim speed:
+                  </label>
+                  <select
+                    className="rounded-md border border-gray-300 bg-white px-2 py-1 text-sm dark:bg-neutral-900 dark:border-neutral-700"
+                    value={simSpeedKmh}
+                    onChange={(e) =>
+                      setSimSpeedKmh(parseInt(e.target.value, 10))
+                    }
+                  >
+                    <option value={20}>20 km/h</option>
+                    <option value={40}>40 km/h</option>
+                    <option value={60}>60 km/h</option>
+                    <option value={80}>80 km/h</option>
+                  </select>
+
+                  {!simulateOn ? (
+                    <button
+                      className={`${btnOutline} px-3 py-2`}
+                      onClick={startSimulation}
+                    >
+                      Simulate GPS
+                    </button>
+                  ) : (
+                    <button
+                      className={`${btnDanger} px-3 py-2`}
+                      onClick={stopSimulation}
+                    >
+                      Stop Simulation
+                    </button>
+                  )}
+                </div>
+
                 <div className="text-xs text-gray-600 dark:text-neutral-300">
                   Off-route:{" "}
                   <span
@@ -817,7 +924,7 @@ export default function LeafletHazardMap() {
       {/* Map */}
       <div className="flex-1">
         <MapContainer
-          ref={mapRef as any} // keep ref; avoid whenCreated
+          ref={mapRef as any}
           center={(start as LatLngExpression) || [-6.2, 106.816]}
           zoom={12}
           style={{ height: "100%", width: "100%" }}
@@ -842,7 +949,7 @@ export default function LeafletHazardMap() {
 
           <Polyline positions={route || []} pathOptions={{ weight: 6 }} />
 
-          {/* Draw layers are ALWAYS mounted so hazards remain visible across modes */}
+          {/* Draw layers ALWAYS mounted so hazards remain visible across modes */}
           <FeatureGroup
             ref={(fg) => {
               drawnItemsRef.current = fg
@@ -917,13 +1024,15 @@ export default function LeafletHazardMap() {
           <div className="font-semibold mb-1">Tips</div>
           {mode === "hazard" ? (
             <>
-              <div>• Use Hazard Point + buffer for quick avoid.</div>
+              <div>• Use Hazard Point + Buffer for quick avoid.</div>
               <div>• Draw polygon/rectangle/circle for specific areas.</div>
             </>
           ) : (
             <>
               <div>• Search “From/To” then Get Directions.</div>
-              <div>• Start Navigation for live GPS & off-route check.</div>
+              <div>
+                • Start Navigation or Simulate GPS to test realtime updates.
+              </div>
             </>
           )}
         </div>
